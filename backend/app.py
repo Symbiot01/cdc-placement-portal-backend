@@ -396,7 +396,7 @@ def create_app(
         origin.strip()
         for origin in os.environ.get(
             "CDC_CORS_ORIGINS",
-            "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:8765,http://localhost:8765",
+            "https://ewrpkgp.in,https://www.ewrpkgp.in,http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:8765,http://localhost:8765",
         ).split(",")
         if origin.strip()
     ]
