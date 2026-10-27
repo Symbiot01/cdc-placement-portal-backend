@@ -1,0 +1,14 @@
+# Never commit secrets or runtime SQLite/token data
+.env
+.env.*
+.enverp
+*.pem
+*.key
+*.secret
+backend/data/
+*.sqlite3*
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store
