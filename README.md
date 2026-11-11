@@ -3,7 +3,7 @@
 Privacy-preserving, security-hardened FastAPI backend for the IIT Kharagpur CDC Placement Portal.
 
 ## Security & Privacy Guarantees
-- **Zero-Credential Boundary:** Rejects (`HTTP 400`) any payload containing ERP credentials (`rollno`, `password`, `security_answers`, `otp`, `ssoToken`, `cookies`).
+- **Zero-Credential Boundary:** Rejects (`HTTP 400`) any payload containing ERP credentials or mailbox tokens (`rollno`, `password`, `security_answers`, `otp`, `ssoToken`, `cookies`, `access_token`, `refresh_token`).
 - **Cryptographic CV Set Binding:** Verifies `sha256(CV1|CV2|CV3) == cvset_hash` and issues HMAC-SHA256 `X-CDC-Session-Token` headers.
 - **In-RAM + SQLite WAL Cache:** Serves cached `cv_diffs` and role recommendations in sub-millisecond time without re-uploading CVs or re-calling the LLM.
 - **Single-Flight Concurrency & Rate Limiting:** Deduplicates concurrent requests per `cvset_hash` and enforces per-IP sliding-window rate limits + daily per-student LLM quotas.

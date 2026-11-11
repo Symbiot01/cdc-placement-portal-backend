@@ -6,7 +6,7 @@ Accepts ONLY user-consented non-credential CDC data:
 - Placement notices
 
 Security guarantees:
-1. Strictly rejects any payload containing ERP credentials (rollno, password, security answers, OTP, cookies).
+1. Strictly rejects any payload containing ERP credentials (rollno, password, security answers, OTP, cookies, Gmail OAuth tokens).
 2. Verifies cryptographic binding (`sha256(cv1|cv2|cv3) == cvset_hash`) and PDF header/size limits.
 3. Issues and verifies HMAC-SHA256 `session_token` bound to `cvset_hash` + `student_hash`.
 4. Enforces per-IP sliding-window rate limits and per-student daily LLM call quotas to protect Gemini billing.
@@ -130,6 +130,10 @@ FORBIDDEN_CREDENTIAL_KEYS = {
     "otp",
     "ssotoken",
     "cookies",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "gmail_token",
 }
 
 HEX_HASH_RE = re.compile(r"^[A-Fa-f0-9_\-]{16,128}$")

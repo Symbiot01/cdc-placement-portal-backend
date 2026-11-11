@@ -30,7 +30,15 @@ def test_rejects_any_erp_credentials_at_boundary(tmp_path: Path) -> None:
     app = create_app(db_path=tmp_path / "cache.sqlite3")
     client = TestClient(app)
 
-    for forbidden_field in ("rollno", "password", "security_answers", "otp", "ssoToken"):
+    for forbidden_field in (
+        "rollno",
+        "password",
+        "security_answers",
+        "otp",
+        "ssoToken",
+        "access_token",
+        "refresh_token",
+    ):
         resp = client.post(
             "/api/v1/sync-cdc-snapshot",
             json={
