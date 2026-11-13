@@ -27,6 +27,7 @@ import re
 import secrets
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -34,10 +35,11 @@ logger = logging.getLogger("cdc_portal.api")
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.cache_store import CdcCacheStore, CvVerificationError
+from backend.erp_login import is_poller_enabled
 from backend.llm_matcher import (
     LlmUnavailableError,
     analyze_cvs_and_roles_with_llm,
@@ -45,6 +47,8 @@ from backend.llm_matcher import (
     load_dotenv_file,
     match_roles_with_llm,
 )
+from backend.notifier import WhatsAppNotifier, mask_phone
+from backend.poller import PollerScheduler
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = Path(
@@ -191,17 +195,67 @@ class MatchCvsRequest(BaseModel):
     roles: list[RoleSnapshotItem] = Field(..., min_length=1, max_length=100)
 
 
-def _contains_forbidden_keys(obj: Any) -> str | None:
+class TriggerPollerRequest(BaseModel):
+    """Zero-credential trigger payload for protected admin / external cron calls."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dry_run: bool = False
+    seed_only: bool = False
+
+
+class RemoveSubscriberRequest(BaseModel):
+    """Admin payload to unsubscribe a member by hashed `subscriber_id`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    subscriber_id: str = Field(..., min_length=8, max_length=64)
+
+
+SAFE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9._\-]{1,256}$")
+MIN_ADMIN_SECRET_LENGTH = 24
+MIN_WEBHOOK_SECRET_LENGTH = 12
+MIN_JOIN_CODE_LENGTH = 8
+JOIN_CMD_RE = re.compile(r"^\s*(?:join|subscribe|start)\s+(\S+)\s*$", re.IGNORECASE)
+UNSUB_CMD_RE = re.compile(r"^\s*(?:stop|leave|unsubscribe)\s*$", re.IGNORECASE)
+
+
+def _get_runtime_secret(name: str, root_dir: Path | None = None) -> str:
+    val = (os.environ.get(name) or "").strip()
+    if val:
+        return val
+    base = root_dir or ROOT_DIR
+    for env_file in (base / ".env", base / ".enverp"):
+        loaded = load_dotenv_file(env_file).get(name, "").strip()
+        if loaded:
+            return loaded
+    return ""
+
+
+def _extract_admin_secret_header(request: Request) -> str:
+    direct = request.headers.get("X-CDC-Admin-Secret", "").strip()
+    if direct:
+        return direct
+    auth = request.headers.get("Authorization", "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+def _contains_forbidden_keys(obj: Any, *, allow_meta_user_id: bool = False) -> str | None:
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if str(k).lower() in FORBIDDEN_CREDENTIAL_KEYS:
+            key_low = str(k).lower()
+            if allow_meta_user_id and key_low == "user_id":
+                pass
+            elif key_low in FORBIDDEN_CREDENTIAL_KEYS:
                 return str(k)
-            nested = _contains_forbidden_keys(v)
+            nested = _contains_forbidden_keys(v, allow_meta_user_id=allow_meta_user_id)
             if nested:
                 return nested
     elif isinstance(obj, list):
         for item in obj:
-            nested = _contains_forbidden_keys(item)
+            nested = _contains_forbidden_keys(item, allow_meta_user_id=allow_meta_user_id)
             if nested:
                 return nested
     return None
@@ -371,30 +425,52 @@ def _run_llm_for_roles_and_diffs(
 def create_app(
     db_path: Path | None = None,
     *,
+    root_dir: Path | None = None,
     require_kgp_roll: bool | None = None,
     max_requests_per_minute: int = 90,
     max_daily_llm_calls: int = 30,
+    start_poller_daemon: bool | None = None,
 ) -> FastAPI:
     resolved_db_path = db_path or DEFAULT_DB_PATH
+    resolved_root_dir = (
+        root_dir if root_dir is not None else (db_path.parent if db_path is not None else ROOT_DIR)
+    )
     store = CdcCacheStore(resolved_db_path)
     enforce_roll = (
         require_kgp_roll
         if require_kgp_roll is not None
         else os.environ.get("CDC_REQUIRE_KGP_ROLL", "0") == "1"
     )
+    should_start_daemon = (
+        start_poller_daemon if start_poller_daemon is not None else (db_path is None)
+    )
     token_secret = _load_or_create_token_secret(resolved_db_path)
     rate_limiter = SlidingWindowRateLimiter(
         max_requests=max_requests_per_minute, window_seconds=60.0
     )
+    admin_fail_limiter = SlidingWindowRateLimiter(max_requests=10, window_seconds=60.0)
+    join_attempt_limiter = SlidingWindowRateLimiter(max_requests=8, window_seconds=300.0)
+    poller_scheduler = PollerScheduler(store, root_dir=resolved_root_dir)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if should_start_daemon:
+            poller_scheduler.start_if_enabled()
+        try:
+            yield
+        finally:
+            poller_scheduler.stop()
 
     app = FastAPI(
         title="IIT KGP CDC Privacy-Preserving AI Matcher & Cache",
-        version="2.2.0",
+        version="2.3.0",
         docs_url=None,
         redoc_url=None,
+        lifespan=lifespan,
     )
     app.state.store = store
     app.state.token_secret = token_secret
+    app.state.poller_scheduler = poller_scheduler
 
     allowed_origins = [
         origin.strip()
@@ -409,7 +485,12 @@ def create_app(
         CORSMiddleware,
         allow_origins=allowed_origins,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "X-CDC-Session-Token"],
+        allow_headers=[
+            "Content-Type",
+            "X-CDC-Session-Token",
+            "X-CDC-Admin-Secret",
+            "Authorization",
+        ],
     )
 
     @app.middleware("http")
@@ -432,7 +513,8 @@ def create_app(
                 raw_json = json.loads(body_bytes.decode("utf-8"))
             except Exception:
                 raw_json = None
-            bad_key = _contains_forbidden_keys(raw_json)
+            is_wa_webhook = request.url.path == "/api/v1/whatsapp/webhook"
+            bad_key = _contains_forbidden_keys(raw_json, allow_meta_user_id=is_wa_webhook)
             if bad_key:
                 return JSONResponse(
                     status_code=400,
@@ -449,6 +531,22 @@ def create_app(
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    def _require_admin_auth(request: Request) -> None:
+        expected = _get_runtime_secret("CDC_ADMIN_SECRET", resolved_root_dir)
+        if len(expected) < MIN_ADMIN_SECRET_LENGTH:
+            raise HTTPException(
+                status_code=503,
+                detail="Poller admin API is disabled until CDC_ADMIN_SECRET (min 24 characters) is configured.",
+            )
+        provided = _extract_admin_secret_header(request)
+        if not provided or not hmac.compare_digest(
+            provided.encode("utf-8"), expected.encode("utf-8")
+        ):
+            client_ip = _extract_client_ip(request)
+            if not admin_fail_limiter.allow(f"admin_fail:{client_ip}"):
+                raise HTTPException(status_code=429, detail="Too many failed admin authentication attempts.")
+            raise HTTPException(status_code=401, detail="Invalid or missing X-CDC-Admin-Secret")
+
     @app.get("/api/v1/health")
     def health() -> dict[str, Any]:
         cfg = get_llm_config()
@@ -456,6 +554,8 @@ def create_app(
         return {
             "ok": True,
             "llm_configured": llm_configured,
+            "poller_enabled": is_poller_enabled(resolved_root_dir),
+            "poller_running": poller_scheduler.is_running,
         }
 
     @app.get("/api/v1/cvset-status/{cvset_hash}")
@@ -670,6 +770,258 @@ def create_app(
             "session_token": session_token,
             "cv_diffs": cv_diffs,
             "recommendations": ordered,
+        }
+
+    # ------------------------------------------------- Poller & WhatsApp APIs
+
+    @app.get("/api/v1/poller/status")
+    def poller_status(request: Request) -> dict[str, Any]:
+        """Protected operational status of the 15/30-min ERP -> WhatsApp cron job (zero secrets)."""
+        _require_admin_auth(request)
+        return poller_scheduler.status_snapshot()
+
+    @app.post("/api/v1/poller/trigger")
+    def poller_trigger(req: TriggerPollerRequest, request: Request) -> dict[str, Any]:
+        """Protected single-flight trigger for an immediate ERP -> WhatsApp poll cycle."""
+        _require_admin_auth(request)
+        return poller_scheduler.execute_cycle(
+            trigger_source="manual_api",
+            dry_run=req.dry_run,
+            seed_only=req.seed_only,
+        )
+
+    @app.get("/api/v1/whatsapp/group-invite")
+    def whatsapp_group_invite(request: Request) -> dict[str, Any]:
+        """Protected admin endpoint returning the shareable `wa.me` secret join link & subscriber count."""
+        _require_admin_auth(request)
+        join_code = _get_runtime_secret("WA_JOIN_CODE", resolved_root_dir)
+        business_phone = re.sub(
+            r"[^\d]", "", _get_runtime_secret("WA_BUSINESS_PHONE_NUMBER", resolved_root_dir)
+        )
+        notifier = WhatsAppNotifier.from_env(resolved_root_dir, allow_empty_recipients=True)
+        invite_link: str | None = None
+        if len(join_code) >= MIN_JOIN_CODE_LENGTH and len(business_phone) >= 7:
+            if notifier is not None:
+                invite_link = notifier.build_invite_link(join_code)
+            else:
+                import urllib.parse as _up
+
+                invite_link = f"https://wa.me/{business_phone}?text={_up.quote(f'JOIN {join_code}')}"
+
+        subscribers = store.list_whatsapp_subscribers_summary()
+        active_count = sum(1 for s in subscribers if s["subscribed"])
+        return {
+            "ok": True,
+            "mode": "join_link_broadcast",
+            "join_code_configured": len(join_code) >= MIN_JOIN_CODE_LENGTH,
+            "business_phone_configured": len(business_phone) >= 7,
+            "invite_link": invite_link,
+            "instructions": (
+                "Share `invite_link` with trusted members. Tapping it opens WhatsApp with "
+                "the pre-filled `JOIN <code>` message; sending it auto-subscribes them to CDC alerts "
+                "(replying `STOP` unsubscribes anytime)."
+            ),
+            "subscribers_active_count": active_count,
+            "subscribers": subscribers,
+        }
+
+    @app.post("/api/v1/whatsapp/subscribers/remove")
+    def whatsapp_remove_subscriber(req: RemoveSubscriberRequest, request: Request) -> dict[str, Any]:
+        """Protected admin endpoint to revoke a subscriber by hashed `subscriber_id`."""
+        _require_admin_auth(request)
+        removed = store.unsubscribe_whatsapp_member(req.subscriber_id)
+        return {
+            "ok": True,
+            "removed": removed,
+            "subscribers_active_count": sum(
+                1 for s in store.list_whatsapp_subscribers_summary() if s["subscribed"]
+            ),
+        }
+
+    @app.get("/api/v1/whatsapp/webhook", response_class=PlainTextResponse)
+    def whatsapp_webhook_verify(request: Request) -> PlainTextResponse:
+        """Meta WhatsApp Cloud API webhook verification handshake (`hub.challenge`)."""
+        expected_token = _get_runtime_secret("WA_WEBHOOK_VERIFY_TOKEN", resolved_root_dir)
+        if len(expected_token) < MIN_WEBHOOK_SECRET_LENGTH:
+            raise HTTPException(
+                status_code=503,
+                detail="WhatsApp webhook verification is disabled until WA_WEBHOOK_VERIFY_TOKEN is set.",
+            )
+        mode = request.query_params.get("hub.mode", "").strip()
+        verify_token = request.query_params.get("hub.verify_token", "").strip()
+        challenge = request.query_params.get("hub.challenge", "").strip()
+
+        if mode != "subscribe" or not hmac.compare_digest(
+            verify_token.encode("utf-8"), expected_token.encode("utf-8")
+        ):
+            raise HTTPException(status_code=403, detail="Webhook verification failed")
+
+        if not SAFE_CHALLENGE_RE.match(challenge):
+            raise HTTPException(status_code=400, detail="Invalid hub.challenge format")
+
+        return PlainTextResponse(content=challenge, media_type="text/plain")
+
+    @app.post("/api/v1/whatsapp/webhook")
+    async def whatsapp_webhook_receive(request: Request) -> dict[str, Any]:
+        """Meta WhatsApp Cloud API signed event receiver (24h opt-in windows & delivery receipts)."""
+        app_secret = _get_runtime_secret("WA_APP_SECRET", resolved_root_dir)
+        if len(app_secret) < 16:
+            raise HTTPException(
+                status_code=503,
+                detail="WhatsApp webhook receiver is disabled until WA_APP_SECRET is configured.",
+            )
+
+        raw_body = await request.body()
+        sig_header = request.headers.get("X-Hub-Signature-256", "").strip()
+        if not sig_header.startswith("sha256="):
+            raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
+        provided_sig = sig_header[len("sha256=") :].strip().lower()
+        expected_sig = hmac.new(
+            app_secret.encode("utf-8"), raw_body, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(provided_sig, expected_sig):
+            raise HTTPException(status_code=401, detail="Invalid X-Hub-Signature-256 signature")
+
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Malformed webhook JSON") from exc
+
+        inbound_recorded = 0
+        statuses_recorded = 0
+        joined_count = 0
+        unsubscribed_count = 0
+        expected_join_code = _get_runtime_secret("WA_JOIN_CODE", resolved_root_dir)
+        reply_notifier: WhatsAppNotifier | None = None
+
+        def _get_reply_notifier() -> WhatsAppNotifier | None:
+            nonlocal reply_notifier
+            if reply_notifier is None:
+                reply_notifier = WhatsAppNotifier.from_env(
+                    resolved_root_dir, allow_empty_recipients=True
+                )
+            return reply_notifier
+
+        entries = payload.get("entry") if isinstance(payload, dict) else None
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            for change in entry.get("changes") or []:
+                if not isinstance(change, dict):
+                    continue
+                value = change.get("value")
+                if not isinstance(value, dict):
+                    continue
+
+                # Map wa_id -> profile.name for friendly masked subscriber display
+                contacts_by_waid: dict[str, str] = {}
+                for ct in value.get("contacts") or []:
+                    if not isinstance(ct, dict):
+                        continue
+                    wa_id = re.sub(r"[^\d]", "", str(ct.get("wa_id") or ""))
+                    prof = ct.get("profile")
+                    pname = str(prof.get("name") or "").strip() if isinstance(prof, dict) else ""
+                    if wa_id and pname:
+                        contacts_by_waid[wa_id] = pname[:60]
+
+                for msg in value.get("messages") or []:
+                    if not isinstance(msg, dict):
+                        continue
+                    sender = str(msg.get("from") or "").strip()
+                    if not sender:
+                        continue
+                    try:
+                        ts = float(msg.get("timestamp")) if msg.get("timestamp") else None
+                    except (TypeError, ValueError):
+                        ts = None
+                    store.record_whatsapp_optin(sender, status="inbound", timestamp=ts)
+                    inbound_recorded += 1
+
+                    # Parse text commands for secret invite-link join / unsubscribe
+                    text_obj = msg.get("text")
+                    msg_body = (
+                        str(text_obj.get("body") or "").strip()
+                        if isinstance(text_obj, dict)
+                        else ""
+                    )
+                    if not msg_body:
+                        continue
+
+                    if UNSUB_CMD_RE.match(msg_body):
+                        if store.unsubscribe_whatsapp_member(sender):
+                            unsubscribed_count += 1
+                            rn = _get_reply_notifier()
+                            if rn is not None:
+                                rn.send_text_message(
+                                    to_e164=f"+{re.sub(r'[^0-9]', '', sender)}",
+                                    text="You have been unsubscribed from IIT KGP CDC Placement Alerts. Use the invite link anytime to rejoin.",
+                                )
+                        continue
+
+                    join_match = JOIN_CMD_RE.match(msg_body)
+                    if join_match and len(expected_join_code) >= MIN_JOIN_CODE_LENGTH:
+                        sender_digits = re.sub(r"[^\d]", "", sender)
+                        if not join_attempt_limiter.allow(f"wa_join:{sender_digits}"):
+                            logger.warning(
+                                "Rate-limited repeated WhatsApp JOIN attempts from %s",
+                                mask_phone(f"+{sender_digits}"),
+                            )
+                            continue
+                        candidate_code = join_match.group(1).strip()
+                        if hmac.compare_digest(
+                            candidate_code.encode("utf-8"),
+                            expected_join_code.encode("utf-8"),
+                        ):
+                            sub_info = store.subscribe_whatsapp_member(
+                                sender_digits,
+                                display_name=contacts_by_waid.get(sender_digits, ""),
+                                timestamp=ts,
+                            )
+                            if sub_info is not None:
+                                joined_count += 1
+                                rn = _get_reply_notifier()
+                                if rn is not None:
+                                    welcome_text = (
+                                        "You are already subscribed to IIT KGP CDC Placement Alerts! Reply STOP anytime to leave."
+                                        if sub_info["already_subscribed"]
+                                        else "Subscribed to IIT KGP CDC Placement Alerts! You will automatically receive new placement notices and PDF attachments here. Reply STOP anytime to unsubscribe."
+                                    )
+                                    rn.send_text_message(
+                                        to_e164=f"+{sender_digits}",
+                                        text=welcome_text,
+                                    )
+                        else:
+                            logger.warning(
+                                "Rejected invalid WhatsApp JOIN code from %s",
+                                mask_phone(f"+{sender_digits}"),
+                            )
+
+                for st in value.get("statuses") or []:
+                    if not isinstance(st, dict):
+                        continue
+                    recipient = str(st.get("recipient_id") or "").strip()
+                    state = str(st.get("status") or "").strip().lower()
+                    if recipient and state:
+                        store.record_whatsapp_optin(recipient, status=f"delivery:{state}")
+                        statuses_recorded += 1
+                        if state == "failed":
+                            errs = st.get("errors")
+                            first_err = errs[0] if isinstance(errs, list) and errs else {}
+                            code = first_err.get("code") if isinstance(first_err, dict) else None
+                            title = first_err.get("title") if isinstance(first_err, dict) else ""
+                            logger.warning(
+                                "WhatsApp delivery failed for %s: code=%s %s",
+                                mask_phone(f"+{recipient}"),
+                                code,
+                                str(title)[:120],
+                            )
+
+        return {
+            "ok": True,
+            "inbound_recorded": inbound_recorded,
+            "statuses_recorded": statuses_recorded,
+            "joined_count": joined_count,
+            "unsubscribed_count": unsubscribed_count,
         }
 
     return app

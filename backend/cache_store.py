@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import io
+import json
+import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -89,8 +93,70 @@ class CdcCacheStore:
         self._ram_cv_sets: dict[str, dict[str, str]] = {}
         self._ram_recs: dict[str, dict[str, dict[str, Any]]] = {}
         self._llm_quota_by_subject: dict[str, tuple[str, int]] = {}
+        self._phone_cipher_key: bytes = self._load_or_create_phone_cipher_key()
         self._init_schema()
         self._warm_ram_cache()
+
+    def _load_or_create_phone_cipher_key(self) -> bytes:
+        """Load or atomically create a 256-bit key (`0600`) for encrypting subscriber phone numbers at rest."""
+        env_key = (os.environ.get("CDC_SUBSCRIBER_CIPHER_KEY") or "").strip()
+        if len(env_key) >= 32:
+            return hashlib.sha256(f"cdc_sub_key:{env_key}".encode("utf-8")).digest()
+
+        key_file = self.db_path.parent / ".wa_subscriber_key"
+        try:
+            if key_file.is_file():
+                raw = key_file.read_text(encoding="utf-8").strip()
+                if len(raw) >= 64:
+                    return bytes.fromhex(raw[:64])
+            generated_hex = secrets.token_hex(32)
+            fd = os.open(str(key_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(generated_hex)
+            os.chmod(str(key_file), 0o600)
+            return bytes.fromhex(generated_hex)
+        except OSError:
+            return secrets.token_bytes(32)
+
+    def _encrypt_phone(self, normalized_e164: str) -> str:
+        """Authenticated stream encryption (`nonce || ciphertext || hmac_sha256`) using stdlib primitives."""
+        plaintext = normalized_e164.encode("utf-8")
+        nonce = secrets.token_bytes(16)
+        enc_key = hmac.new(self._phone_cipher_key, b"enc:" + nonce, hashlib.sha256).digest()
+        ciphertext = bytes(b ^ enc_key[i % len(enc_key)] for i, b in enumerate(plaintext))
+        tag = hmac.new(
+            self._phone_cipher_key,
+            b"mac:" + nonce + ciphertext,
+            hashlib.sha256,
+        ).digest()[:16]
+        return "v1:" + base64.urlsafe_b64encode(nonce + ciphertext + tag).decode("ascii")
+
+    def _decrypt_phone(self, token: str) -> str | None:
+        if not token or not token.startswith("v1:"):
+            return None
+        try:
+            raw = base64.urlsafe_b64decode(token[3:].encode("ascii"))
+        except Exception:
+            return None
+        if len(raw) < 33:
+            return None
+        nonce = raw[:16]
+        tag = raw[-16:]
+        ciphertext = raw[16:-16]
+        expected_tag = hmac.new(
+            self._phone_cipher_key,
+            b"mac:" + nonce + ciphertext,
+            hashlib.sha256,
+        ).digest()[:16]
+        if not hmac.compare_digest(tag, expected_tag):
+            return None
+        enc_key = hmac.new(self._phone_cipher_key, b"enc:" + nonce, hashlib.sha256).digest()
+        plaintext = bytes(b ^ enc_key[i % len(enc_key)] for i, b in enumerate(ciphertext))
+        try:
+            decoded = plaintext.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        return decoded if decoded.startswith("+") else None
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=15.0, check_same_thread=False)
@@ -157,6 +223,49 @@ class CdcCacheStore:
                     day_utc TEXT NOT NULL,
                     calls INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (subject_key, day_utc)
+                );
+
+                -- Authoritative "already alerted" ledger for the ERP notice poller.
+                -- Kept separate from `notices` because that table is written by the
+                -- browser sync too, and dedupe there must not suppress an alert.
+                CREATE TABLE IF NOT EXISTS notice_notifications (
+                    notice_id TEXT PRIMARY KEY,
+                    channel TEXT NOT NULL DEFAULT '',
+                    recipients INTEGER NOT NULL DEFAULT 0,
+                    attachment_sent INTEGER NOT NULL DEFAULT 0,
+                    notified_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS poller_runs (
+                    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    polled_at REAL NOT NULL,
+                    trigger_source TEXT NOT NULL DEFAULT 'cron',
+                    status TEXT NOT NULL DEFAULT 'ok',
+                    total_notices INTEGER NOT NULL DEFAULT 0,
+                    new_notices INTEGER NOT NULL DEFAULT 0,
+                    seeded_notices INTEGER NOT NULL DEFAULT 0,
+                    delivered INTEGER NOT NULL DEFAULT 0,
+                    attachments_sent INTEGER NOT NULL DEFAULT 0,
+                    errors_json TEXT NOT NULL DEFAULT '[]'
+                );
+
+                CREATE TABLE IF NOT EXISTS whatsapp_optins (
+                    recipient_hash TEXT PRIMARY KEY,
+                    masked_phone TEXT NOT NULL,
+                    last_inbound_at REAL NOT NULL,
+                    last_status TEXT NOT NULL DEFAULT 'inbound'
+                );
+
+                CREATE TABLE IF NOT EXISTS whatsapp_broadcast_subscribers (
+                    recipient_hash TEXT PRIMARY KEY,
+                    masked_phone TEXT NOT NULL,
+                    encrypted_phone TEXT NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    subscribed INTEGER NOT NULL DEFAULT 1,
+                    joined_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    last_inbound_at REAL NOT NULL DEFAULT 0.0,
+                    last_delivery_status TEXT NOT NULL DEFAULT ''
                 );
                 """
             )
@@ -440,6 +549,389 @@ class CdcCacheStore:
                 )
                 count += 1
         return count
+
+    def existing_notice_ids(self) -> set[str]:
+        """All notice ids ever seen (from either the browser sync or the poller)."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT notice_id FROM notices").fetchall()
+        return {str(r["notice_id"]) for r in rows}
+
+    def notified_notice_ids(self) -> set[str]:
+        """Notice ids already delivered to the alert channels."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT notice_id FROM notice_notifications").fetchall()
+        return {str(r["notice_id"]) for r in rows}
+
+    def select_unnotified_notices(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return only notices that have never been alerted, preserving input order.
+
+        Dedupe is keyed on the ERP notice id and backed by the `notice_notifications`
+        ledger, so a restart, a retry, or a repeat poll cannot re-alert the same notice.
+        """
+        if not candidates:
+            return []
+        already = self.notified_notice_ids()
+        fresh: list[dict[str, Any]] = []
+        seen_in_batch: set[str] = set()
+        for item in candidates:
+            nid = str(item.get("id", "")).strip()[:32]
+            if not nid or nid in already or nid in seen_in_batch:
+                continue
+            seen_in_batch.add(nid)
+            fresh.append({**item, "id": nid})
+        return fresh
+
+    def mark_notices_notified(
+        self,
+        notices: list[dict[str, Any]],
+        *,
+        channel: str,
+        recipients: int = 0,
+        attachment_sent: bool = False,
+    ) -> int:
+        """Record that these notices were delivered, making future polls idempotent."""
+        if not notices:
+            return 0
+        now = time.time()
+        marked = 0
+        with self._lock, self._connect() as conn:
+            for item in notices:
+                nid = str(item.get("id", "")).strip()[:32]
+                if not nid:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO notice_notifications
+                        (notice_id, channel, recipients, attachment_sent, notified_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(notice_id) DO UPDATE SET
+                        channel = excluded.channel,
+                        recipients = excluded.recipients,
+                        attachment_sent = excluded.attachment_sent,
+                        notified_at = excluded.notified_at
+                    """,
+                    (
+                        nid,
+                        channel[:40],
+                        int(recipients),
+                        1 if attachment_sent else 0,
+                        now,
+                    ),
+                )
+                marked += 1
+        return marked
+
+    def record_poller_run(
+        self,
+        summary: dict[str, Any],
+        *,
+        trigger_source: str = "cron",
+        max_history: int = 100,
+    ) -> dict[str, Any]:
+        """Persist a sanitized poller execution summary and prune old rows."""
+        polled_at = float(summary.get("polled_at") or time.time())
+        errors = [str(e)[:280] for e in (summary.get("errors") or [])[:10]]
+        status = str(summary.get("status") or ("error" if errors else "ok"))[:32]
+        total_notices = int(summary.get("total_notices") or 0)
+        new_notices = int(summary.get("new_notices") or 0)
+        seeded_notices = int(summary.get("seeded_notices") or 0)
+        delivered = int(summary.get("delivered") or 0)
+        attachments_sent = int(summary.get("attachments_sent") or 0)
+        clean_source = str(trigger_source or "cron")[:32]
+
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO poller_runs (
+                    polled_at, trigger_source, status, total_notices,
+                    new_notices, seeded_notices, delivered, attachments_sent, errors_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    polled_at,
+                    clean_source,
+                    status,
+                    total_notices,
+                    new_notices,
+                    seeded_notices,
+                    delivered,
+                    attachments_sent,
+                    json.dumps(errors),
+                ),
+            )
+            run_id = int(cursor.lastrowid or 0)
+            conn.execute(
+                """
+                DELETE FROM poller_runs
+                WHERE run_id NOT IN (
+                    SELECT run_id FROM poller_runs ORDER BY run_id DESC LIMIT ?
+                )
+                """,
+                (max(10, int(max_history)),),
+            )
+        return {
+            "run_id": run_id,
+            "polled_at": polled_at,
+            "trigger_source": clean_source,
+            "status": status,
+            "total_notices": total_notices,
+            "new_notices": new_notices,
+            "seeded_notices": seeded_notices,
+            "delivered": delivered,
+            "attachments_sent": attachments_sent,
+            "errors": errors,
+        }
+
+    def get_recent_poller_runs(self, limit: int = 10) -> list[dict[str, Any]]:
+        clamped = max(1, min(50, int(limit)))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT run_id, polled_at, trigger_source, status, total_notices,
+                       new_notices, seeded_notices, delivered, attachments_sent, errors_json
+                FROM poller_runs
+                ORDER BY run_id DESC
+                LIMIT ?
+                """,
+                (clamped,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                errs = json.loads(str(row["errors_json"] or "[]"))
+                if not isinstance(errs, list):
+                    errs = []
+            except Exception:
+                errs = []
+            out.append(
+                {
+                    "run_id": int(row["run_id"]),
+                    "polled_at": float(row["polled_at"]),
+                    "trigger_source": str(row["trigger_source"]),
+                    "status": str(row["status"]),
+                    "total_notices": int(row["total_notices"]),
+                    "new_notices": int(row["new_notices"]),
+                    "seeded_notices": int(row["seeded_notices"]),
+                    "delivered": int(row["delivered"]),
+                    "attachments_sent": int(row["attachments_sent"]),
+                    "errors": [str(e) for e in errs],
+                }
+            )
+        return out
+
+    @staticmethod
+    def _hash_phone(normalized_e164: str) -> str:
+        clean = normalized_e164.strip()
+        if not clean.startswith("+"):
+            clean = f"+{clean}"
+        return hashlib.sha256(f"cdc_wa_phone:{clean}".encode("utf-8")).hexdigest()[:32]
+
+    @staticmethod
+    def _mask_phone(normalized_e164: str) -> str:
+        clean = normalized_e164.strip()
+        if len(clean) <= 6:
+            return "***"
+        return f"{clean[:3]}******{clean[-4:]}"
+
+    def record_whatsapp_optin(
+        self,
+        e164_phone: str,
+        *,
+        status: str = "inbound",
+        timestamp: float | None = None,
+    ) -> None:
+        """Record inbound WhatsApp contact or delivery state using hashed phone only (zero raw PII in SQLite)."""
+        digits = re.sub(r"[^\d]", "", e164_phone or "")
+        if len(digits) < 7 or len(digits) > 15:
+            return
+        normalized = f"+{digits}"
+        r_hash = self._hash_phone(normalized)
+        masked = self._mask_phone(normalized)
+        ts = float(timestamp if timestamp is not None else time.time())
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO whatsapp_optins (recipient_hash, masked_phone, last_inbound_at, last_status)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(recipient_hash) DO UPDATE SET
+                    last_inbound_at = CASE
+                        WHEN excluded.last_status = 'inbound' THEN MAX(whatsapp_optins.last_inbound_at, excluded.last_inbound_at)
+                        ELSE whatsapp_optins.last_inbound_at
+                    END,
+                    last_status = excluded.last_status
+                """,
+                (r_hash, masked, ts if status == "inbound" else 0.0, str(status)[:40]),
+            )
+            if status == "inbound":
+                conn.execute(
+                    """
+                    UPDATE whatsapp_broadcast_subscribers
+                    SET last_inbound_at = MAX(last_inbound_at, ?), updated_at = ?
+                    WHERE recipient_hash = ?
+                    """,
+                    (ts, time.time(), r_hash),
+                )
+            elif status.startswith("delivery:"):
+                conn.execute(
+                    """
+                    UPDATE whatsapp_broadcast_subscribers
+                    SET last_delivery_status = ?, updated_at = ?
+                    WHERE recipient_hash = ?
+                    """,
+                    (str(status)[:40], time.time(), r_hash),
+                )
+
+    def subscribe_whatsapp_member(
+        self,
+        e164_phone: str,
+        *,
+        display_name: str = "",
+        timestamp: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Add or re-activate a member in the business-managed WhatsApp broadcast group (encrypted at rest)."""
+        digits = re.sub(r"[^\d]", "", e164_phone or "")
+        if len(digits) < 7 or len(digits) > 15:
+            return None
+        normalized = f"+{digits}"
+        r_hash = self._hash_phone(normalized)
+        masked = self._mask_phone(normalized)
+        enc_phone = self._encrypt_phone(normalized)
+        safe_name = re.sub(r"[\r\n\t]+", " ", (display_name or "")).strip()[:60]
+        now = time.time()
+        inbound_ts = float(timestamp if timestamp is not None else now)
+
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT subscribed FROM whatsapp_broadcast_subscribers WHERE recipient_hash = ?",
+                (r_hash,),
+            ).fetchone()
+            was_already_active = bool(existing and int(existing["subscribed"]) == 1)
+            conn.execute(
+                """
+                INSERT INTO whatsapp_broadcast_subscribers (
+                    recipient_hash, masked_phone, encrypted_phone, display_name,
+                    subscribed, joined_at, updated_at, last_inbound_at, last_delivery_status
+                )
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?, 'subscribed')
+                ON CONFLICT(recipient_hash) DO UPDATE SET
+                    masked_phone = excluded.masked_phone,
+                    encrypted_phone = excluded.encrypted_phone,
+                    display_name = CASE WHEN excluded.display_name != '' THEN excluded.display_name ELSE whatsapp_broadcast_subscribers.display_name END,
+                    subscribed = 1,
+                    updated_at = excluded.updated_at,
+                    last_inbound_at = MAX(whatsapp_broadcast_subscribers.last_inbound_at, excluded.last_inbound_at)
+                """,
+                (r_hash, masked, enc_phone, safe_name, now, now, inbound_ts),
+            )
+            conn.execute(
+                """
+                INSERT INTO whatsapp_optins (recipient_hash, masked_phone, last_inbound_at, last_status)
+                VALUES (?, ?, ?, 'inbound')
+                ON CONFLICT(recipient_hash) DO UPDATE SET
+                    last_inbound_at = MAX(whatsapp_optins.last_inbound_at, excluded.last_inbound_at),
+                    last_status = 'inbound'
+                """,
+                (r_hash, masked, inbound_ts),
+            )
+        return {
+            "recipient_hash": r_hash,
+            "masked_phone": masked,
+            "already_subscribed": was_already_active,
+        }
+
+    def unsubscribe_whatsapp_member(self, e164_phone_or_hash: str) -> bool:
+        """Unsubscribe a member by phone number or 32-char `recipient_hash`."""
+        raw = (e164_phone_or_hash or "").strip()
+        if re.fullmatch(r"[0-9a-f]{32}", raw.lower()):
+            r_hash = raw.lower()
+        else:
+            digits = re.sub(r"[^\d]", "", raw)
+            if len(digits) < 7 or len(digits) > 15:
+                return False
+            r_hash = self._hash_phone(f"+{digits}")
+
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE whatsapp_broadcast_subscribers
+                SET subscribed = 0, updated_at = ?
+                WHERE recipient_hash = ? AND subscribed = 1
+                """,
+                (time.time(), r_hash),
+            )
+            return int(cur.rowcount or 0) > 0
+
+    def list_active_subscriber_phones(self) -> list[str]:
+        """Decrypt active subscriber E.164 phone numbers in-RAM strictly for outbound notice dispatch."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT encrypted_phone
+                FROM whatsapp_broadcast_subscribers
+                WHERE subscribed = 1
+                ORDER BY joined_at ASC
+                """
+            ).fetchall()
+        phones: list[str] = []
+        for row in rows:
+            dec = self._decrypt_phone(str(row["encrypted_phone"] or ""))
+            if dec and dec not in phones:
+                phones.append(dec)
+        return phones
+
+    def list_whatsapp_subscribers_summary(self) -> list[dict[str, Any]]:
+        """Zero-PII operational summary of broadcast subscribers (never returns raw phone numbers)."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT recipient_hash, masked_phone, display_name, subscribed,
+                       joined_at, last_inbound_at, last_delivery_status
+                FROM whatsapp_broadcast_subscribers
+                ORDER BY subscribed DESC, joined_at ASC
+                """
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            last_in = float(row["last_inbound_at"] or 0.0)
+            out.append(
+                {
+                    "subscriber_id": str(row["recipient_hash"]),
+                    "masked_phone": str(row["masked_phone"]),
+                    "display_name": str(row["display_name"] or ""),
+                    "subscribed": bool(int(row["subscribed"]) == 1),
+                    "joined_at": float(row["joined_at"]),
+                    "window_24h_open": last_in > 0 and (now - last_in) < 86400,
+                    "last_delivery_status": str(row["last_delivery_status"] or ""),
+                }
+            )
+        return out
+
+    def check_recipients_optin_windows(self, recipients_e164: list[str]) -> list[dict[str, Any]]:
+        """Check 24h customer-service window status for configured recipients without exposing raw numbers."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            rows = {
+                str(r["recipient_hash"]): (float(r["last_inbound_at"]), str(r["last_status"]))
+                for r in conn.execute(
+                    "SELECT recipient_hash, last_inbound_at, last_status FROM whatsapp_optins"
+                ).fetchall()
+            }
+        statuses: list[dict[str, Any]] = []
+        for phone in recipients_e164:
+            r_hash = self._hash_phone(phone)
+            last_inbound_at, last_status = rows.get(r_hash, (0.0, "never_seen"))
+            window_open = last_inbound_at > 0 and (now - last_inbound_at) < 86400
+            statuses.append(
+                {
+                    "masked_phone": self._mask_phone(phone),
+                    "opted_in_ever": last_inbound_at > 0,
+                    "window_24h_open": window_open,
+                    "last_status": last_status,
+                }
+            )
+        return statuses
 
     def get_cached_recommendation(
         self,
